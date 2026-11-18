@@ -308,6 +308,32 @@ int I010ToI420(const uint16_t* src_y,
                int width,
                int height);
 
+// Maximum dither strength for the *Dither conversion functions below.
+// The unit is roughly 1/16 of an 8-bit LSB of ordered (8x8 Bayer) dither
+// amplitude, so LIBYUV_DITHER_MAX gives approximately +/-0.5 LSB, enough to
+// cover one full quantization step. Larger values are clamped to this bound;
+// 0 disables dithering and produces output identical to the corresponding
+// function without the Dither suffix.
+#define LIBYUV_DITHER_MAX 8
+
+// Convert 10 bit YUV to 8 bit with ordered dithering to reduce banding.
+LIBYUV_API
+int I010ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_u,
+                     int src_stride_u,
+                     const uint16_t* src_v,
+                     int src_stride_v,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength);
+
 #define H210ToH420 I210ToI420
 LIBYUV_API
 int I210ToI420(const uint16_t* src_y,
@@ -324,6 +350,24 @@ int I210ToI420(const uint16_t* src_y,
                int dst_stride_v,
                int width,
                int height);
+
+// Convert 10 bit 4:2:2 YUV to 8 bit 4:2:0 with ordered dithering.
+LIBYUV_API
+int I210ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_u,
+                     int src_stride_u,
+                     const uint16_t* src_v,
+                     int src_stride_v,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength);
 
 #define H210ToH422 I210ToI422
 LIBYUV_API
@@ -359,6 +403,24 @@ int I410ToI420(const uint16_t* src_y,
                int width,
                int height);
 
+// Convert 10 bit 4:4:4 YUV to 8 bit 4:2:0 with ordered dithering.
+LIBYUV_API
+int I410ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_u,
+                     int src_stride_u,
+                     const uint16_t* src_v,
+                     int src_stride_v,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength);
+
 #define H410ToH444 I410ToI444
 LIBYUV_API
 int I410ToI444(const uint16_t* src_y,
@@ -392,6 +454,24 @@ int I012ToI420(const uint16_t* src_y,
                int dst_stride_v,
                int width,
                int height);
+
+// Convert 12 bit YUV to 8 bit with ordered dithering.
+LIBYUV_API
+int I012ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_u,
+                     int src_stride_u,
+                     const uint16_t* src_v,
+                     int src_stride_v,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength);
 
 #define H212ToH422 I212ToI422
 LIBYUV_API
@@ -905,6 +985,22 @@ int P010ToI420(const uint16_t* src_y,
                int width,
                int height);
 
+// Convert P010 to I420 with ordered dithering.
+LIBYUV_API
+int P010ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_uv,
+                     int src_stride_uv,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength);
+
 // Convert P210 to I420.
 LIBYUV_API
 int P210ToI420(const uint16_t* src_y,
@@ -920,6 +1016,22 @@ int P210ToI420(const uint16_t* src_y,
                int width,
                int height);
 
+// Convert P210 to I420 with ordered dithering.
+LIBYUV_API
+int P210ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_uv,
+                     int src_stride_uv,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength);
+
 // Convert P410 to I420.
 LIBYUV_API
 int P410ToI420(const uint16_t* src_y,
@@ -934,6 +1046,22 @@ int P410ToI420(const uint16_t* src_y,
                int dst_stride_v,
                int width,
                int height);
+
+// Convert P410 to I420 with ordered dithering.
+LIBYUV_API
+int P410ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_uv,
+                     int src_stride_uv,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength);
 
 // Convert P012 to I012.
 LIBYUV_API

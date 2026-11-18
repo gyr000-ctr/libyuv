@@ -36,6 +36,155 @@ static __inline int Abs(int v) {
   return v >= 0 ? v : -v;
 }
 
+#ifdef __cplusplus
+#define STATIC_CAST(type, expr) static_cast<type>(expr)
+#else
+#define STATIC_CAST(type, expr) (type)(expr)
+#endif
+
+static __inline int32_t clamp255(int32_t v) {
+  return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+// Ordered dither for 16 bit to 8 bit conversion.
+// 8x8 Bayer matrix. Each 8x8 block contains each value 0..63 exactly once, so
+// the signed dither term (2 * bayer - 63) sums to exactly zero over every 8x8
+// block, which keeps the 8x8 block mean deviation of the dithered output
+// bounded (at most one 8-bit LSB from the undithered result).
+static const uint8_t kBayer8x8[8][8] = {
+    {0, 32, 8, 40, 2, 34, 10, 42},   {48, 16, 56, 24, 50, 18, 58, 26},
+    {12, 44, 4, 36, 14, 46, 6, 38},  {60, 28, 52, 20, 62, 30, 54, 22},
+    {3, 35, 11, 43, 1, 33, 9, 41},   {51, 19, 59, 27, 49, 17, 57, 25},
+    {15, 47, 7, 39, 13, 45, 5, 37},  {63, 31, 55, 23, 61, 29, 53, 21},
+};
+
+// Dither term in 1/65536 of an 8-bit LSB, including a +0.5 LSB rounding bias.
+// dither_strength is clamped by callers to [1, LIBYUV_DITHER_MAX]; at the
+// maximum the amplitude is approximately +/-0.5 LSB.
+#define DITHER_TERM(bayer_value, dither_strength) \
+  (((int)(bayer_value)*2 - 63) * (dither_strength)*64 + 32768)
+
+// Convert a row of 16 bit pixels to 8 bit with ordered dithering.
+// scale is the same fixed point multiplier as Convert16To8Row_C.
+// y is the destination row index, used to phase the 8x8 dither matrix.
+static void Convert16To8RowDither(const uint16_t* src_y,
+                                  uint8_t* dst_y,
+                                  int scale,
+                                  int width,
+                                  int y,
+                                  int dither_strength) {
+  const uint8_t* bayer = kBayer8x8[y & 7];
+  int x;
+  for (x = 0; x < width; ++x) {
+    const int d = DITHER_TERM(bayer[x & 7], dither_strength);
+    dst_y[x] = STATIC_CAST(
+        uint8_t,
+        clamp255((int32_t)((uint32_t)src_y[x] * (uint32_t)scale + d) >> 16));
+  }
+}
+
+// Convert a plane of 16 bit pixels to 8 bit with ordered dithering.
+static void Convert16To8PlaneDither(const uint16_t* src_y,
+                                    int src_stride_y,
+                                    uint8_t* dst_y,
+                                    int dst_stride_y,
+                                    int scale,
+                                    int width,
+                                    int height,
+                                    int dither_strength) {
+  int y;
+  for (y = 0; y < height; ++y) {
+    Convert16To8RowDither(src_y, dst_y, scale, width, y, dither_strength);
+    src_y += src_stride_y;
+    dst_y += dst_stride_y;
+  }
+}
+
+// Average 2 rows of 16 bit pixels to 1 row of 8 bit, with ordered dithering.
+static void HalfRow16To8Dither(const uint16_t* src_uv,
+                               ptrdiff_t src_uv_stride,
+                               uint8_t* dst_uv,
+                               int scale,
+                               int width,
+                               int y,
+                               int dither_strength) {
+  const uint8_t* bayer = kBayer8x8[y & 7];
+  int x;
+  for (x = 0; x < width; ++x) {
+    const uint16_t v = STATIC_CAST(
+        uint16_t, (src_uv[x] + src_uv[src_uv_stride + x] + 1) >> 1);
+    const int d = DITHER_TERM(bayer[x & 7], dither_strength);
+    dst_uv[x] = STATIC_CAST(
+        uint8_t, clamp255((int32_t)((uint32_t)v * (uint32_t)scale + d) >> 16));
+  }
+}
+
+// Average 2x2 blocks of 16 bit pixels to 8 bit, with ordered dithering.
+// Source has 2 * width pixels per row (even luma width).
+static void HalfWidthRow16To8Dither(const uint16_t* src_uv,
+                                    ptrdiff_t src_uv_stride,
+                                    uint8_t* dst_uv,
+                                    int scale,
+                                    int width,
+                                    int y,
+                                    int dither_strength) {
+  const uint8_t* bayer = kBayer8x8[y & 7];
+  const uint16_t* s = src_uv;
+  const uint16_t* t = src_uv + src_uv_stride;
+  int x;
+  for (x = 0; x < width; ++x) {
+    const uint16_t v =
+        STATIC_CAST(uint16_t, (s[0] + s[1] + t[0] + t[1] + 2) >> 2);
+    const int d = DITHER_TERM(bayer[x & 7], dither_strength);
+    dst_uv[x] = STATIC_CAST(
+        uint8_t, clamp255((int32_t)((uint32_t)v * (uint32_t)scale + d) >> 16));
+    s += 2;
+    t += 2;
+  }
+}
+
+// Same as HalfWidthRow16To8Dither, but the source has 2 * width - 1 pixels
+// per row (odd luma width); the last pixel averages 2 vertical samples.
+static void HalfWidthRow16To8OddDither(const uint16_t* src_uv,
+                                       ptrdiff_t src_uv_stride,
+                                       uint8_t* dst_uv,
+                                       int scale,
+                                       int width,
+                                       int y,
+                                       int dither_strength) {
+  const uint8_t* bayer = kBayer8x8[y & 7];
+  const uint16_t* s = src_uv;
+  const uint16_t* t = src_uv + src_uv_stride;
+  int x;
+  for (x = 0; x < width - 1; ++x) {
+    const uint16_t v =
+        STATIC_CAST(uint16_t, (s[0] + s[1] + t[0] + t[1] + 2) >> 2);
+    const int d = DITHER_TERM(bayer[x & 7], dither_strength);
+    dst_uv[x] = STATIC_CAST(
+        uint8_t, clamp255((int32_t)((uint32_t)v * (uint32_t)scale + d) >> 16));
+    s += 2;
+    t += 2;
+  }
+  {
+    const uint16_t v = STATIC_CAST(uint16_t, (s[0] + t[0] + 1) >> 1);
+    const int d = DITHER_TERM(bayer[(width - 1) & 7], dither_strength);
+    dst_uv[width - 1] = STATIC_CAST(
+        uint8_t, clamp255((int32_t)((uint32_t)v * (uint32_t)scale + d) >> 16));
+  }
+}
+
+// Clamp dither strength to [0, LIBYUV_DITHER_MAX]. 0 selects the undithered
+// (bit-exact) conversion path.
+static int ClampDitherStrength(int dither_strength) {
+  if (dither_strength < 0) {
+    return 0;
+  }
+  if (dither_strength > LIBYUV_DITHER_MAX) {
+    return LIBYUV_DITHER_MAX;
+  }
+  return dither_strength;
+}
+
 // Apply a 2 rows to 1 row function (HalfRow, HalfBoxRow or HalfBoxUVRow) to a
 // plane. The last row of an odd height is averaged with itself.
 #define HALFPLANE(NAME, T)                                                     \
@@ -180,7 +329,8 @@ static int Planar16bitTo8bit(const uint16_t* src_y,
                              int height,
                              int subsample_x,
                              int subsample_y,
-                             int depth) {
+                             int depth,
+                             int dither_strength) {
   if ((!src_y && dst_y) || !src_u || !src_v || !dst_u || !dst_v || width <= 0 ||
       height == 0 || height == INT_MIN) {
     return -1;
@@ -200,6 +350,20 @@ static int Planar16bitTo8bit(const uint16_t* src_y,
     src_v = src_v + (ptrdiff_t)(uv_height - 1) * src_stride_v;
     src_stride_u = -src_stride_u;
     src_stride_v = -src_stride_v;
+  }
+
+  if (dither_strength > 0) {
+    // Dithered path (C only). The undithered path below is bit-exact across
+    // ISAs; dithering trades that for banding-free gradients.
+    if (dst_y) {
+      Convert16To8PlaneDither(src_y, src_stride_y, dst_y, dst_stride_y, scale,
+                              width, height, dither_strength);
+    }
+    Convert16To8PlaneDither(src_u, src_stride_u, dst_u, dst_stride_u, scale,
+                            uv_width, uv_height, dither_strength);
+    Convert16To8PlaneDither(src_v, src_stride_v, dst_v, dst_stride_v, scale,
+                            uv_width, uv_height, dither_strength);
+    return 0;
   }
 
   // Convert Y plane.
@@ -229,7 +393,8 @@ static int I41xToI420(const uint16_t* src_y,
                       int dst_stride_v,
                       int width,
                       int height,
-                      int depth) {
+                      int depth,
+                      int dither_strength) {
   int y;
   const int scale = 1 << (24 - depth);
   const int uv_width = SUBSAMPLE(width, 1, 1);
@@ -254,6 +419,51 @@ static int I41xToI420(const uint16_t* src_y,
     src_v = src_v + (ptrdiff_t)(height - 1) * src_stride_v;
     src_stride_u = -src_stride_u;
     src_stride_v = -src_stride_v;
+  }
+
+  if (dither_strength > 0) {
+    // Dithered path (C only).
+    for (y = 0; y < height - 1; y += 2) {
+      if (width & 1) {
+        HalfWidthRow16To8OddDither(src_u, src_stride_u, dst_u, scale, uv_width,
+                                   y >> 1, dither_strength);
+        HalfWidthRow16To8OddDither(src_v, src_stride_v, dst_v, scale, uv_width,
+                                   y >> 1, dither_strength);
+      } else {
+        HalfWidthRow16To8Dither(src_u, src_stride_u, dst_u, scale, uv_width,
+                                y >> 1, dither_strength);
+        HalfWidthRow16To8Dither(src_v, src_stride_v, dst_v, scale, uv_width,
+                                y >> 1, dither_strength);
+      }
+      if (dst_y) {
+        Convert16To8RowDither(src_y, dst_y, scale, width, y, dither_strength);
+        Convert16To8RowDither(src_y + src_stride_y, dst_y + dst_stride_y,
+                              scale, width, y + 1, dither_strength);
+        src_y += src_stride_y * 2;
+        dst_y += dst_stride_y * 2;
+      }
+      src_u += src_stride_u * 2;
+      src_v += src_stride_v * 2;
+      dst_u += dst_stride_u;
+      dst_v += dst_stride_v;
+    }
+    if (height & 1) {
+      if (width & 1) {
+        HalfWidthRow16To8OddDither(src_u, 0, dst_u, scale, uv_width, y >> 1,
+                                   dither_strength);
+        HalfWidthRow16To8OddDither(src_v, 0, dst_v, scale, uv_width, y >> 1,
+                                   dither_strength);
+      } else {
+        HalfWidthRow16To8Dither(src_u, 0, dst_u, scale, uv_width, y >> 1,
+                                dither_strength);
+        HalfWidthRow16To8Dither(src_v, 0, dst_v, scale, uv_width, y >> 1,
+                                dither_strength);
+      }
+      if (dst_y) {
+        Convert16To8RowDither(src_y, dst_y, scale, width, y, dither_strength);
+      }
+    }
+    return 0;
   }
 
 #if defined(HAS_CONVERT16TO8ROW_NEON)
@@ -483,7 +693,8 @@ static int I21xToI420(const uint16_t* src_y,
                       int dst_stride_v,
                       int width,
                       int height,
-                      int depth) {
+                      int depth,
+                      int dither_strength) {
   int y;
   const int scale = 1 << (24 - depth);
   const int uv_width = SUBSAMPLE(width, 1, 1);
@@ -508,6 +719,37 @@ static int I21xToI420(const uint16_t* src_y,
     src_v = src_v + (ptrdiff_t)(height - 1) * src_stride_v;
     src_stride_u = -src_stride_u;
     src_stride_v = -src_stride_v;
+  }
+
+  if (dither_strength > 0) {
+    // Dithered path (C only).
+    for (y = 0; y < height - 1; y += 2) {
+      HalfRow16To8Dither(src_u, src_stride_u, dst_u, scale, uv_width, y >> 1,
+                         dither_strength);
+      HalfRow16To8Dither(src_v, src_stride_v, dst_v, scale, uv_width, y >> 1,
+                         dither_strength);
+      if (dst_y) {
+        Convert16To8RowDither(src_y, dst_y, scale, width, y, dither_strength);
+        Convert16To8RowDither(src_y + src_stride_y, dst_y + dst_stride_y,
+                              scale, width, y + 1, dither_strength);
+        src_y += src_stride_y * 2;
+        dst_y += dst_stride_y * 2;
+      }
+      src_u += src_stride_u * 2;
+      src_v += src_stride_v * 2;
+      dst_u += dst_stride_u;
+      dst_v += dst_stride_v;
+    }
+    if (height & 1) {
+      HalfRow16To8Dither(src_u, 0, dst_u, scale, uv_width, y >> 1,
+                         dither_strength);
+      HalfRow16To8Dither(src_v, 0, dst_v, scale, uv_width, y >> 1,
+                         dither_strength);
+      if (dst_y) {
+        Convert16To8RowDither(src_y, dst_y, scale, width, y, dither_strength);
+      }
+    }
+    return 0;
   }
 
 #if defined(HAS_CONVERT16TO8ROW_NEON)
@@ -701,7 +943,32 @@ int I010ToI420(const uint16_t* src_y,
   return Planar16bitTo8bit(src_y, src_stride_y, src_u, src_stride_u, src_v,
                            src_stride_v, dst_y, dst_stride_y, dst_u,
                            dst_stride_u, dst_v, dst_stride_v, width, height, 1,
-                           1, 10);
+                           1, 10, 0);
+}
+
+// Convert 10 bit YUV to 8 bit with ordered (8x8 Bayer) dithering.
+// dither_strength 0 gives output identical to I010ToI420; values are clamped
+// to [0, LIBYUV_DITHER_MAX].
+LIBYUV_API
+int I010ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_u,
+                     int src_stride_u,
+                     const uint16_t* src_v,
+                     int src_stride_v,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength) {
+  return Planar16bitTo8bit(src_y, src_stride_y, src_u, src_stride_u, src_v,
+                           src_stride_v, dst_y, dst_stride_y, dst_u,
+                           dst_stride_u, dst_v, dst_stride_v, width, height, 1,
+                           1, 10, ClampDitherStrength(dither_strength));
 }
 
 LIBYUV_API
@@ -721,7 +988,32 @@ int I210ToI420(const uint16_t* src_y,
                int height) {
   return I21xToI420(src_y, src_stride_y, src_u, src_stride_u, src_v,
                     src_stride_v, dst_y, dst_stride_y, dst_u, dst_stride_u,
-                    dst_v, dst_stride_v, width, height, 10);
+                    dst_v, dst_stride_v, width, height, 10, 0);
+}
+
+// Convert 10 bit 4:2:2 YUV to 8 bit 4:2:0 with ordered dithering.
+// dither_strength 0 gives output identical to I210ToI420; values are clamped
+// to [0, LIBYUV_DITHER_MAX].
+LIBYUV_API
+int I210ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_u,
+                     int src_stride_u,
+                     const uint16_t* src_v,
+                     int src_stride_v,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength) {
+  return I21xToI420(src_y, src_stride_y, src_u, src_stride_u, src_v,
+                    src_stride_v, dst_y, dst_stride_y, dst_u, dst_stride_u,
+                    dst_v, dst_stride_v, width, height, 10,
+                    ClampDitherStrength(dither_strength));
 }
 
 LIBYUV_API
@@ -742,7 +1034,7 @@ int I210ToI422(const uint16_t* src_y,
   return Planar16bitTo8bit(src_y, src_stride_y, src_u, src_stride_u, src_v,
                            src_stride_v, dst_y, dst_stride_y, dst_u,
                            dst_stride_u, dst_v, dst_stride_v, width, height, 1,
-                           0, 10);
+                           0, 10, 0);
 }
 
 LIBYUV_API
@@ -762,7 +1054,32 @@ int I410ToI420(const uint16_t* src_y,
                int height) {
   return I41xToI420(src_y, src_stride_y, src_u, src_stride_u, src_v,
                     src_stride_v, dst_y, dst_stride_y, dst_u, dst_stride_u,
-                    dst_v, dst_stride_v, width, height, 10);
+                    dst_v, dst_stride_v, width, height, 10, 0);
+}
+
+// Convert 10 bit 4:4:4 YUV to 8 bit 4:2:0 with ordered dithering.
+// dither_strength 0 gives output identical to I410ToI420; values are clamped
+// to [0, LIBYUV_DITHER_MAX].
+LIBYUV_API
+int I410ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_u,
+                     int src_stride_u,
+                     const uint16_t* src_v,
+                     int src_stride_v,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength) {
+  return I41xToI420(src_y, src_stride_y, src_u, src_stride_u, src_v,
+                    src_stride_v, dst_y, dst_stride_y, dst_u, dst_stride_u,
+                    dst_v, dst_stride_v, width, height, 10,
+                    ClampDitherStrength(dither_strength));
 }
 
 LIBYUV_API
@@ -783,7 +1100,7 @@ int I410ToI444(const uint16_t* src_y,
   return Planar16bitTo8bit(src_y, src_stride_y, src_u, src_stride_u, src_v,
                            src_stride_v, dst_y, dst_stride_y, dst_u,
                            dst_stride_u, dst_v, dst_stride_v, width, height, 0,
-                           0, 10);
+                           0, 10, 0);
 }
 
 LIBYUV_API
@@ -804,7 +1121,32 @@ int I012ToI420(const uint16_t* src_y,
   return Planar16bitTo8bit(src_y, src_stride_y, src_u, src_stride_u, src_v,
                            src_stride_v, dst_y, dst_stride_y, dst_u,
                            dst_stride_u, dst_v, dst_stride_v, width, height, 1,
-                           1, 12);
+                           1, 12, 0);
+}
+
+// Convert 12 bit YUV to 8 bit with ordered dithering.
+// dither_strength 0 gives output identical to I012ToI420; values are clamped
+// to [0, LIBYUV_DITHER_MAX].
+LIBYUV_API
+int I012ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_u,
+                     int src_stride_u,
+                     const uint16_t* src_v,
+                     int src_stride_v,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength) {
+  return Planar16bitTo8bit(src_y, src_stride_y, src_u, src_stride_u, src_v,
+                           src_stride_v, dst_y, dst_stride_y, dst_u,
+                           dst_stride_u, dst_v, dst_stride_v, width, height, 1,
+                           1, 12, ClampDitherStrength(dither_strength));
 }
 
 LIBYUV_API
@@ -825,7 +1167,7 @@ int I212ToI422(const uint16_t* src_y,
   return Planar16bitTo8bit(src_y, src_stride_y, src_u, src_stride_u, src_v,
                            src_stride_v, dst_y, dst_stride_y, dst_u,
                            dst_stride_u, dst_v, dst_stride_v, width, height, 1,
-                           0, 12);
+                           0, 12, 0);
 }
 
 LIBYUV_API
@@ -845,7 +1187,7 @@ int I212ToI420(const uint16_t* src_y,
                int height) {
   return I21xToI420(src_y, src_stride_y, src_u, src_stride_u, src_v,
                     src_stride_v, dst_y, dst_stride_y, dst_u, dst_stride_u,
-                    dst_v, dst_stride_v, width, height, 12);
+                    dst_v, dst_stride_v, width, height, 12, 0);
 }
 
 LIBYUV_API
@@ -866,7 +1208,7 @@ int I412ToI444(const uint16_t* src_y,
   return Planar16bitTo8bit(src_y, src_stride_y, src_u, src_stride_u, src_v,
                            src_stride_v, dst_y, dst_stride_y, dst_u,
                            dst_stride_u, dst_v, dst_stride_v, width, height, 0,
-                           0, 12);
+                           0, 12, 0);
 }
 
 LIBYUV_API
@@ -886,7 +1228,7 @@ int I412ToI420(const uint16_t* src_y,
                int height) {
   return I41xToI420(src_y, src_stride_y, src_u, src_stride_u, src_v,
                     src_stride_v, dst_y, dst_stride_y, dst_u, dst_stride_u,
-                    dst_v, dst_stride_v, width, height, 12);
+                    dst_v, dst_stride_v, width, height, 12, 0);
 }
 
 LIBYUV_API
@@ -3651,7 +3993,8 @@ static int Px10ToI420(const uint16_t* src_y,
                       int width,
                       int height,
                       int subsample_x,
-                      int subsample_y) {
+                      int subsample_y,
+                      int dither_strength) {
   const int scale16 = 256;  // P*10 stores 10-bit in the MSBs.
   int src_uv_width;
   int dst_uv_width;
@@ -3667,8 +4010,13 @@ static int Px10ToI420(const uint16_t* src_y,
   dst_uv_width = SUBSAMPLE(width, 1, 1);
 
   if (dst_y) {
-    Convert16To8Plane(src_y, src_stride_y, dst_y, dst_stride_y, scale16, width,
-                      height);
+    if (dither_strength > 0) {
+      Convert16To8PlaneDither(src_y, src_stride_y, dst_y, dst_stride_y, scale16,
+                              width, height, dither_strength);
+    } else {
+      Convert16To8Plane(src_y, src_stride_y, dst_y, dst_stride_y, scale16,
+                        width, height);
+    }
   }
 
   if (subsample_x && subsample_y) {
@@ -3832,7 +4180,15 @@ static int Px10ToI420(const uint16_t* src_y,
       return 1;
     }
     for (y = 0; y < uv_height; ++y) {
-      Convert16To8Row(src_uv, row_uv, scale16, uv_packed);
+      if (dither_strength > 0) {
+        // Dither the packed UV row. The 8x8 Bayer matrix has equal even/odd
+        // column sums per 2x2 block, so each 8x8 block of the split U and V
+        // planes still gets a zero-mean dither term.
+        Convert16To8RowDither(src_uv, row_uv, scale16, uv_packed, y,
+                              dither_strength);
+      } else {
+        Convert16To8Row(src_uv, row_uv, scale16, uv_packed);
+      }
       SplitUVRow(row_uv, dst_u, dst_v, src_uv_width);
       src_uv += src_stride_uv;
       dst_u += dst_stride_u;
@@ -4107,16 +4463,55 @@ static int Px10ToI420(const uint16_t* src_y,
       for (y = 0; y < height - 1; y += 2) {
         SplitUVRow_16(src_uv, row_u0, row_v0, 10, src_uv_width);
         SplitUVRow_16(src_uv + src_stride_uv, row_u1, row_v1, 10, src_uv_width);
-        Half16To8(row_u0, row_stride, dst_u, scale, dst_uv_width);
-        Half16To8(row_v0, row_stride, dst_v, scale, dst_uv_width);
+        if (dither_strength > 0) {
+          // Dithered path (C only).
+          if (subsample_x) {
+            HalfRow16To8Dither(row_u0, row_stride, dst_u, scale, dst_uv_width,
+                               y >> 1, dither_strength);
+            HalfRow16To8Dither(row_v0, row_stride, dst_v, scale, dst_uv_width,
+                               y >> 1, dither_strength);
+          } else if (width & 1) {
+            HalfWidthRow16To8OddDither(row_u0, row_stride, dst_u, scale,
+                                       dst_uv_width, y >> 1, dither_strength);
+            HalfWidthRow16To8OddDither(row_v0, row_stride, dst_v, scale,
+                                       dst_uv_width, y >> 1, dither_strength);
+          } else {
+            HalfWidthRow16To8Dither(row_u0, row_stride, dst_u, scale,
+                                    dst_uv_width, y >> 1, dither_strength);
+            HalfWidthRow16To8Dither(row_v0, row_stride, dst_v, scale,
+                                    dst_uv_width, y >> 1, dither_strength);
+          }
+        } else {
+          Half16To8(row_u0, row_stride, dst_u, scale, dst_uv_width);
+          Half16To8(row_v0, row_stride, dst_v, scale, dst_uv_width);
+        }
         src_uv += src_stride_uv * 2;
         dst_u += dst_stride_u;
         dst_v += dst_stride_v;
       }
       if (height & 1) {
         SplitUVRow_16(src_uv, row_u0, row_v0, 10, src_uv_width);
-        Half16To8(row_u0, 0, dst_u, scale, dst_uv_width);
-        Half16To8(row_v0, 0, dst_v, scale, dst_uv_width);
+        if (dither_strength > 0) {
+          if (subsample_x) {
+            HalfRow16To8Dither(row_u0, 0, dst_u, scale, dst_uv_width, y >> 1,
+                               dither_strength);
+            HalfRow16To8Dither(row_v0, 0, dst_v, scale, dst_uv_width, y >> 1,
+                               dither_strength);
+          } else if (width & 1) {
+            HalfWidthRow16To8OddDither(row_u0, 0, dst_u, scale, dst_uv_width,
+                                       y >> 1, dither_strength);
+            HalfWidthRow16To8OddDither(row_v0, 0, dst_v, scale, dst_uv_width,
+                                       y >> 1, dither_strength);
+          } else {
+            HalfWidthRow16To8Dither(row_u0, 0, dst_u, scale, dst_uv_width,
+                                    y >> 1, dither_strength);
+            HalfWidthRow16To8Dither(row_v0, 0, dst_v, scale, dst_uv_width,
+                                    y >> 1, dither_strength);
+          }
+        } else {
+          Half16To8(row_u0, 0, dst_u, scale, dst_uv_width);
+          Half16To8(row_v0, 0, dst_v, scale, dst_uv_width);
+        }
       }
     }
     free_aligned_buffer_64(row_u);
@@ -4139,7 +4534,29 @@ int P010ToI420(const uint16_t* src_y,
                int height) {
   return Px10ToI420(src_y, src_stride_y, src_uv, src_stride_uv, dst_y,
                     dst_stride_y, dst_u, dst_stride_u, dst_v, dst_stride_v,
-                    width, height, 1, 1);
+                    width, height, 1, 1, 0);
+}
+
+// Convert P010 to I420 with ordered dithering.
+// dither_strength 0 gives output identical to P010ToI420; values are clamped
+// to [0, LIBYUV_DITHER_MAX].
+LIBYUV_API
+int P010ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_uv,
+                     int src_stride_uv,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength) {
+  return Px10ToI420(src_y, src_stride_y, src_uv, src_stride_uv, dst_y,
+                    dst_stride_y, dst_u, dst_stride_u, dst_v, dst_stride_v,
+                    width, height, 1, 1, ClampDitherStrength(dither_strength));
 }
 
 LIBYUV_API
@@ -4157,7 +4574,29 @@ int P210ToI420(const uint16_t* src_y,
                int height) {
   return Px10ToI420(src_y, src_stride_y, src_uv, src_stride_uv, dst_y,
                     dst_stride_y, dst_u, dst_stride_u, dst_v, dst_stride_v,
-                    width, height, 1, 0);
+                    width, height, 1, 0, 0);
+}
+
+// Convert P210 to I420 with ordered dithering.
+// dither_strength 0 gives output identical to P210ToI420; values are clamped
+// to [0, LIBYUV_DITHER_MAX].
+LIBYUV_API
+int P210ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_uv,
+                     int src_stride_uv,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength) {
+  return Px10ToI420(src_y, src_stride_y, src_uv, src_stride_uv, dst_y,
+                    dst_stride_y, dst_u, dst_stride_u, dst_v, dst_stride_v,
+                    width, height, 1, 0, ClampDitherStrength(dither_strength));
 }
 
 LIBYUV_API
@@ -4175,7 +4614,29 @@ int P410ToI420(const uint16_t* src_y,
                int height) {
   return Px10ToI420(src_y, src_stride_y, src_uv, src_stride_uv, dst_y,
                     dst_stride_y, dst_u, dst_stride_u, dst_v, dst_stride_v,
-                    width, height, 0, 0);
+                    width, height, 0, 0, 0);
+}
+
+// Convert P410 to I420 with ordered dithering.
+// dither_strength 0 gives output identical to P410ToI420; values are clamped
+// to [0, LIBYUV_DITHER_MAX].
+LIBYUV_API
+int P410ToI420Dither(const uint16_t* src_y,
+                     int src_stride_y,
+                     const uint16_t* src_uv,
+                     int src_stride_uv,
+                     uint8_t* dst_y,
+                     int dst_stride_y,
+                     uint8_t* dst_u,
+                     int dst_stride_u,
+                     uint8_t* dst_v,
+                     int dst_stride_v,
+                     int width,
+                     int height,
+                     int dither_strength) {
+  return Px10ToI420(src_y, src_stride_y, src_uv, src_stride_uv, dst_y,
+                    dst_stride_y, dst_u, dst_stride_u, dst_v, dst_stride_v,
+                    width, height, 0, 0, ClampDitherStrength(dither_strength));
 }
 
 LIBYUV_API

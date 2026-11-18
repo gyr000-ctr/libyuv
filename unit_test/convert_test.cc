@@ -9,6 +9,7 @@
  */
 
 #include <assert.h>
+#include <climits>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -227,6 +228,213 @@ TESTPLANARTOP(I212, uint16_t, 2, 2, 1, I420, uint8_t, 1, 2, 2, 12)
 TESTPLANARTOP(I212, uint16_t, 2, 2, 1, I422, uint8_t, 1, 2, 1, 12)
 TESTPLANARTOP(I412, uint16_t, 2, 1, 1, I420, uint8_t, 1, 2, 2, 12)
 TESTPLANARTOP(I412, uint16_t, 2, 1, 1, I444, uint8_t, 1, 1, 1, 12)
+
+// Verify dithered 16 to 8 bit conversion stays within 1 LSB of the undithered
+// result per pixel and per 8x8 block mean, and returns the number of pixels
+// that changed.
+static int ExpectDitherBoundedPlane(const uint8_t* ref,
+                                    const uint8_t* dithered,
+                                    int width,
+                                    int height) {
+  int num_diff = 0;
+  for (int by = 0; by < height; by += 8) {
+    const int y_end = by + 8 > height ? height : by + 8;
+    for (int bx = 0; bx < width; bx += 8) {
+      const int x_end = bx + 8 > width ? width : bx + 8;
+      int sum_ref = 0;
+      int sum_dithered = 0;
+      for (int y = by; y < y_end; ++y) {
+        for (int x = bx; x < x_end; ++x) {
+          const int r = ref[y * width + x];
+          const int d = dithered[y * width + x];
+          EXPECT_GE(d - r, 0);
+          EXPECT_LE(d - r, 1);
+          sum_ref += r;
+          sum_dithered += d;
+        }
+      }
+      // 8x8 block mean deviation is at most one 8-bit LSB.
+      EXPECT_GE(sum_dithered - sum_ref, 0);
+      EXPECT_LE(sum_dithered - sum_ref, 64);
+      num_diff += sum_dithered - sum_ref;
+    }
+  }
+  return num_diff;
+}
+
+// Test dithered conversions from planar 16 bit formats to I420.
+// SRC_FMT in {I010, I210, I410, I012}; checks that strength 0 is byte
+// identical to the undithered function, that strength is clamped to
+// LIBYUV_DITHER_MAX, and that dithering is bounded and actually dithers.
+#define TESTDITHERPLANAR(SRC_FMT, SRC_SUBSAMP_X, SRC_SUBSAMP_Y, SRC_DEPTH, W, \
+                         H)                                                   \
+  TEST_F(LibYUVConvertTest, SRC_FMT##ToI420Dither_Bounds) {                   \
+    const int kWidth = W;                                                     \
+    const int kHeight = H;                                                    \
+    const int kSrcUVWidth = SUBSAMPLE(kWidth, SRC_SUBSAMP_X);                 \
+    const int kSrcUVHeight = SUBSAMPLE(kHeight, SRC_SUBSAMP_Y);               \
+    const int kDstUVWidth = SUBSAMPLE(kWidth, 2);                             \
+    const int kDstUVHeight = SUBSAMPLE(kHeight, 2);                           \
+    const uint16_t kMaxVal = (1 << SRC_DEPTH) - 1;                            \
+    align_buffer_page_end(src_y, kWidth* kHeight * 2);                        \
+    align_buffer_page_end(src_u, kSrcUVWidth * kSrcUVHeight * 2);             \
+    align_buffer_page_end(src_v, kSrcUVWidth * kSrcUVHeight * 2);             \
+    align_buffer_page_end(dst_y_ref, kWidth* kHeight);                        \
+    align_buffer_page_end(dst_u_ref, kDstUVWidth * kDstUVHeight);             \
+    align_buffer_page_end(dst_v_ref, kDstUVWidth * kDstUVHeight);             \
+    align_buffer_page_end(dst_y_a, kWidth* kHeight);                          \
+    align_buffer_page_end(dst_u_a, kDstUVWidth * kDstUVHeight);               \
+    align_buffer_page_end(dst_v_a, kDstUVWidth * kDstUVHeight);               \
+    align_buffer_page_end(dst_y_b, kWidth* kHeight);                          \
+    align_buffer_page_end(dst_u_b, kDstUVWidth * kDstUVHeight);               \
+    align_buffer_page_end(dst_v_b, kDstUVWidth * kDstUVHeight);               \
+    uint16_t* src_y_p = reinterpret_cast<uint16_t*>(src_y);                   \
+    uint16_t* src_u_p = reinterpret_cast<uint16_t*>(src_u);                   \
+    uint16_t* src_v_p = reinterpret_cast<uint16_t*>(src_v);                   \
+    for (int y = 0; y < kHeight; ++y) {                                       \
+      for (int x = 0; x < kWidth; ++x) {                                      \
+        src_y_p[y * kWidth + x] = (x * 4 + y * 3) & kMaxVal;                  \
+      }                                                                       \
+    }                                                                         \
+    for (int y = 0; y < kSrcUVHeight; ++y) {                                  \
+      for (int x = 0; x < kSrcUVWidth; ++x) {                                 \
+        src_u_p[y * kSrcUVWidth + x] = (x * 5 + y * 7 + 1) & kMaxVal;         \
+        src_v_p[y * kSrcUVWidth + x] = (x * 3 + y * 11 + 2) & kMaxVal;        \
+      }                                                                       \
+    }                                                                         \
+    SRC_FMT##ToI420(src_y_p, kWidth, src_u_p, kSrcUVWidth, src_v_p,           \
+                    kSrcUVWidth, dst_y_ref, kWidth, dst_u_ref, kDstUVWidth,   \
+                    dst_v_ref, kDstUVWidth, kWidth, kHeight);                 \
+    /* Strength 0 must be byte identical to the undithered function. */       \
+    SRC_FMT##ToI420Dither(src_y_p, kWidth, src_u_p, kSrcUVWidth, src_v_p,     \
+                          kSrcUVWidth, dst_y_a, kWidth, dst_u_a, kDstUVWidth, \
+                          dst_v_a, kDstUVWidth, kWidth, kHeight, 0);          \
+    EXPECT_EQ(0, memcmp(dst_y_ref, dst_y_a, kWidth * kHeight));               \
+    EXPECT_EQ(0, memcmp(dst_u_ref, dst_u_a, kDstUVWidth * kDstUVHeight));     \
+    EXPECT_EQ(0, memcmp(dst_v_ref, dst_v_a, kDstUVWidth * kDstUVHeight));     \
+    /* Full strength dithering is bounded and changes the output. */          \
+    SRC_FMT##ToI420Dither(src_y_p, kWidth, src_u_p, kSrcUVWidth, src_v_p,     \
+                          kSrcUVWidth, dst_y_a, kWidth, dst_u_a, kDstUVWidth, \
+                          dst_v_a, kDstUVWidth, kWidth, kHeight,              \
+                          LIBYUV_DITHER_MAX);                                 \
+    EXPECT_GT(ExpectDitherBoundedPlane(dst_y_ref, dst_y_a, kWidth, kHeight),  \
+              0);                                                             \
+    EXPECT_GT(ExpectDitherBoundedPlane(dst_u_ref, dst_u_a, kDstUVWidth,       \
+                                       kDstUVHeight),                         \
+              0);                                                             \
+    EXPECT_GT(ExpectDitherBoundedPlane(dst_v_ref, dst_v_a, kDstUVWidth,       \
+                                       kDstUVHeight),                         \
+              0);                                                             \
+    /* Strengths above LIBYUV_DITHER_MAX are clamped. */                      \
+    SRC_FMT##ToI420Dither(src_y_p, kWidth, src_u_p, kSrcUVWidth, src_v_p,     \
+                          kSrcUVWidth, dst_y_b, kWidth, dst_u_b, kDstUVWidth, \
+                          dst_v_b, kDstUVWidth, kWidth, kHeight,              \
+                          LIBYUV_DITHER_MAX + 1000);                          \
+    EXPECT_EQ(0, memcmp(dst_y_a, dst_y_b, kWidth * kHeight));                 \
+    EXPECT_EQ(0, memcmp(dst_u_a, dst_u_b, kDstUVWidth * kDstUVHeight));       \
+    EXPECT_EQ(0, memcmp(dst_v_a, dst_v_b, kDstUVWidth * kDstUVHeight));       \
+    free_aligned_buffer_page_end(src_y);                                      \
+    free_aligned_buffer_page_end(src_u);                                      \
+    free_aligned_buffer_page_end(src_v);                                      \
+    free_aligned_buffer_page_end(dst_y_ref);                                  \
+    free_aligned_buffer_page_end(dst_u_ref);                                  \
+    free_aligned_buffer_page_end(dst_v_ref);                                  \
+    free_aligned_buffer_page_end(dst_y_a);                                    \
+    free_aligned_buffer_page_end(dst_u_a);                                    \
+    free_aligned_buffer_page_end(dst_v_a);                                    \
+    free_aligned_buffer_page_end(dst_y_b);                                    \
+    free_aligned_buffer_page_end(dst_u_b);                                    \
+    free_aligned_buffer_page_end(dst_v_b);                                    \
+  }
+
+TESTDITHERPLANAR(I010, 2, 2, 10, 72, 48)
+TESTDITHERPLANAR(I210, 2, 1, 10, 72, 47)
+TESTDITHERPLANAR(I410, 1, 1, 10, 71, 47)
+TESTDITHERPLANAR(I012, 2, 2, 12, 72, 48)
+
+// Test dithered conversions from semi-planar (packed UV) 10 bit formats.
+// SRC_FMT in {P010, P210, P410}; 10 bit values are stored in the MSBs.
+#define TESTDITHERBP(SRC_FMT, SRC_SUBSAMP_X, SRC_SUBSAMP_Y, W, H)             \
+  TEST_F(LibYUVConvertTest, SRC_FMT##ToI420Dither_Bounds) {                   \
+    const int kWidth = W;                                                     \
+    const int kHeight = H;                                                    \
+    const int kSrcUVWidth = SUBSAMPLE(kWidth, SRC_SUBSAMP_X);                 \
+    const int kSrcUVHeight = SUBSAMPLE(kHeight, SRC_SUBSAMP_Y);               \
+    const int kDstUVWidth = SUBSAMPLE(kWidth, 2);                             \
+    const int kDstUVHeight = SUBSAMPLE(kHeight, 2);                           \
+    align_buffer_page_end(src_y, kWidth* kHeight * 2);                        \
+    align_buffer_page_end(src_uv, kSrcUVWidth * 2 * kSrcUVHeight * 2);        \
+    align_buffer_page_end(dst_y_ref, kWidth* kHeight);                        \
+    align_buffer_page_end(dst_u_ref, kDstUVWidth * kDstUVHeight);             \
+    align_buffer_page_end(dst_v_ref, kDstUVWidth * kDstUVHeight);             \
+    align_buffer_page_end(dst_y_a, kWidth* kHeight);                          \
+    align_buffer_page_end(dst_u_a, kDstUVWidth * kDstUVHeight);               \
+    align_buffer_page_end(dst_v_a, kDstUVWidth * kDstUVHeight);               \
+    align_buffer_page_end(dst_y_b, kWidth* kHeight);                          \
+    align_buffer_page_end(dst_u_b, kDstUVWidth * kDstUVHeight);               \
+    align_buffer_page_end(dst_v_b, kDstUVWidth * kDstUVHeight);               \
+    uint16_t* src_y_p = reinterpret_cast<uint16_t*>(src_y);                   \
+    uint16_t* src_uv_p = reinterpret_cast<uint16_t*>(src_uv);                 \
+    for (int y = 0; y < kHeight; ++y) {                                       \
+      for (int x = 0; x < kWidth; ++x) {                                      \
+        src_y_p[y * kWidth + x] = ((x * 4 + y * 3) & 1023) << 6;              \
+      }                                                                       \
+    }                                                                         \
+    for (int y = 0; y < kSrcUVHeight; ++y) {                                  \
+      for (int x = 0; x < kSrcUVWidth; ++x) {                                 \
+        src_uv_p[(y * kSrcUVWidth + x) * 2 + 0] =                             \
+            ((x * 5 + y * 7 + 1) & 1023) << 6;                                \
+        src_uv_p[(y * kSrcUVWidth + x) * 2 + 1] =                             \
+            ((x * 3 + y * 11 + 2) & 1023) << 6;                               \
+      }                                                                       \
+    }                                                                         \
+    SRC_FMT##ToI420(src_y_p, kWidth, src_uv_p, kSrcUVWidth * 2, dst_y_ref,    \
+                    kWidth, dst_u_ref, kDstUVWidth, dst_v_ref, kDstUVWidth,   \
+                    kWidth, kHeight);                                         \
+    /* Strength 0 must be byte identical to the undithered function. */       \
+    SRC_FMT##ToI420Dither(src_y_p, kWidth, src_uv_p, kSrcUVWidth * 2,         \
+                          dst_y_a, kWidth, dst_u_a, kDstUVWidth, dst_v_a,     \
+                          kDstUVWidth, kWidth, kHeight, 0);                   \
+    EXPECT_EQ(0, memcmp(dst_y_ref, dst_y_a, kWidth * kHeight));               \
+    EXPECT_EQ(0, memcmp(dst_u_ref, dst_u_a, kDstUVWidth * kDstUVHeight));     \
+    EXPECT_EQ(0, memcmp(dst_v_ref, dst_v_a, kDstUVWidth * kDstUVHeight));     \
+    /* Full strength dithering is bounded and changes the output. */          \
+    SRC_FMT##ToI420Dither(src_y_p, kWidth, src_uv_p, kSrcUVWidth * 2,         \
+                          dst_y_a, kWidth, dst_u_a, kDstUVWidth, dst_v_a,     \
+                          kDstUVWidth, kWidth, kHeight, LIBYUV_DITHER_MAX);   \
+    EXPECT_GT(ExpectDitherBoundedPlane(dst_y_ref, dst_y_a, kWidth, kHeight),  \
+              0);                                                             \
+    EXPECT_GT(ExpectDitherBoundedPlane(dst_u_ref, dst_u_a, kDstUVWidth,       \
+                                       kDstUVHeight),                         \
+              0);                                                             \
+    EXPECT_GT(ExpectDitherBoundedPlane(dst_v_ref, dst_v_a, kDstUVWidth,       \
+                                       kDstUVHeight),                         \
+              0);                                                             \
+    /* Strengths above LIBYUV_DITHER_MAX are clamped. */                      \
+    SRC_FMT##ToI420Dither(src_y_p, kWidth, src_uv_p, kSrcUVWidth * 2,         \
+                          dst_y_b, kWidth, dst_u_b, kDstUVWidth, dst_v_b,     \
+                          kDstUVWidth, kWidth, kHeight,                       \
+                          LIBYUV_DITHER_MAX + 1000);                          \
+    EXPECT_EQ(0, memcmp(dst_y_a, dst_y_b, kWidth * kHeight));                 \
+    EXPECT_EQ(0, memcmp(dst_u_a, dst_u_b, kDstUVWidth * kDstUVHeight));       \
+    EXPECT_EQ(0, memcmp(dst_v_a, dst_v_b, kDstUVWidth * kDstUVHeight));       \
+    free_aligned_buffer_page_end(src_y);                                      \
+    free_aligned_buffer_page_end(src_uv);                                     \
+    free_aligned_buffer_page_end(dst_y_ref);                                  \
+    free_aligned_buffer_page_end(dst_u_ref);                                  \
+    free_aligned_buffer_page_end(dst_v_ref);                                  \
+    free_aligned_buffer_page_end(dst_y_a);                                    \
+    free_aligned_buffer_page_end(dst_u_a);                                    \
+    free_aligned_buffer_page_end(dst_v_a);                                    \
+    free_aligned_buffer_page_end(dst_y_b);                                    \
+    free_aligned_buffer_page_end(dst_u_b);                                    \
+    free_aligned_buffer_page_end(dst_v_b);                                    \
+  }
+
+TESTDITHERBP(P010, 2, 2, 72, 48)
+TESTDITHERBP(P210, 2, 1, 72, 47)
+TESTDITHERBP(P410, 1, 1, 71, 47)
+
 
 // Test Android 420 to I420
 #define TESTAPLANARTOPI(SRC_FMT_PLANAR, PIXEL_STRIDE, SRC_SUBSAMP_X,          \
